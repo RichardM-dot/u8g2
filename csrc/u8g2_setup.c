@@ -1,4 +1,9 @@
 /*
+ * 【中文导读】u8g2_setup.c —— 显示器初始化总装（B级导读）
+ * u8g2_SetupDisplay/SetupFonts：把"屏幕驱动回调+显示尺寸+字体"装进 u8g2_t。
+ */
+
+/*
 
   u8g2_setup.c
 

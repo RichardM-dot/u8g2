@@ -1,4 +1,10 @@
 /*
+ * 【中文导读】u8x8_byte.c —— 字节级传输回调（I2C/SPI 移植接口）
+ * 移植 u8g2 只需实现 u8x8_byte_sw_i2c / u8x8_byte_4wire_hw_spi 这类回调，
+ * 本文件提供软件 I2C 与通用 SPI 的参考实现——移植入口。
+ */
+
+/*
 
   u8x8_byte.c 
   
