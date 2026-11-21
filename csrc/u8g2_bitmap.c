@@ -1,4 +1,21 @@
 /*
+ * ============================================================================
+ * 【中文导读】u8g2_bitmap.c —— 位图绘制（Bitmap / XBM / XBMP 三格式）
+ * ----------------------------------------------------------------------------
+ * 职责：6 个公共入口 = 3 种数据格式 × "整幅 / 单行"两层：
+ *   u8g2_DrawBitmap         整幅；行格式 MSB-first（mask 从 0x80 起），cnt 为每行字节数
+ *   u8g2_DrawXBM            整幅；行格式 LSB-first（mask 从 0x01 起），每行 (w+7)/8 字节
+ *   u8g2_DrawXBMP           同 XBM，但数据在 AVR PROGMEM（读像素经 u8x8_pgm_read）
+ *   u8g2_DrawHorizontalBitmap / DrawHXBM / DrawHXBMP   对应的单行底层
+ * 透明模式：u8g2_SetBitmapMode(1) 时 0 位不画（保背景），0 时画反色 ncolor。
+ * 关键优化：HXBM/HXBMP 内循环先测"同色游程长度"，再一次性调
+ *   u8g2_DrawHVLine 画一整段——比 OLD 宏保留的逐像素版本少一个数量级调用开销。
+ * 位置：应用层 → 本文件 → u8g2_DrawHVLine → u8g2_ll_hvline → 显示缓冲；
+ * 整幅入口均先 u8g2_IsIntersection 剪裁，出屏直接返回。
+ * ============================================================================
+ */
+
+/*
 
   u8g2_bitmap.c
 

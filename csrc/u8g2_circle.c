@@ -1,4 +1,22 @@
 /*
+ * ============================================================================
+ * 【中文导读】u8g2_circle.c —— 圆/圆盘/椭圆图元（整数 Bresenham 族）
+ * ----------------------------------------------------------------------------
+ * 职责：4 组圆形图元，全部基于"增量误差递推"整数算法，无浮点、无乘除：
+ *   u8g2_DrawCircle  → u8g2_draw_circle + u8g2_draw_circle_section      圆周
+ *   u8g2_DrawDisc    → u8g2_draw_disc    + u8g2_draw_disc_section       实心圆盘
+ *   u8g2_DrawEllipse → u8g2_draw_ellipse + u8g2_draw_ellipse_section     椭圆周
+ *   u8g2_DrawFilledEllipse → u8g2_draw_filled_ellipse + ..._section      实心椭圆
+ * 结构模式统一为"误差递推内核 + section 绘制回调"：内核每步算出 1/8 圆弧上的
+ *   (x,y)，section 再用 option 位掩码（U8G2_DRAW_UPPER_* 与 LOWER_*，见 u8g2.h 1895 行）
+ *   把对称点落到四个象限——圆画 2 点/象限（x、y 交换对称），椭圆画 1 点/象限。
+ * 位置：应用层 Draw* → 本文件 → u8g2_DrawPixel / DrawVLine → u8g2_ll_hvline → 显示缓冲。
+ * 入口先 u8g2_IsIntersection 剪裁（U8G2_WITH_INTERSECTION），整圆出屏零开销返回。
+ * 圆角矩形 DrawRBox/DrawRFrame（u8g2_box.c）正是复用本文件的 Circle/Disc 四象限能力。
+ * ============================================================================
+ */
+
+/*
 
   u8g2_circle.c
 

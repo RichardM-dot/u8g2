@@ -1,4 +1,21 @@
 /*
+ * ============================================================================
+ * 【中文导读】u8g2.h —— u8g2 的"总契约"（核心结构体 + 全部 API 声明）
+ * ----------------------------------------------------------------------------
+ * 读 u8g2 源码的第一站。三层结构在本文件交汇：
+ *   1) u8g2_t：图形层上下文——内嵌 u8x8_t（通信层），再加帧缓冲指针、
+ *      裁剪窗口、字体解码器、旋转回调组（cb）；
+ *   2) u8g2_cb_t：旋转/镜像三件套回调（update_dimension / update_page_win /
+ *      draw_l90），换旋转 = 换这组指针；
+ *   3) API 声明区按实现文件分组（u8g2_buffer.c / hvline / box / font ...），
+ *      并带两大生成代码声明区（d_memory 缓冲分配 + d_setup 屏幕装配表）。
+ * 文件体积 4300+ 行，但 2/3 是生成代码声明与字体 extern 列表，人工阅读
+ * 只需关注：u8g2_struct（~L314）、u8x8 wrapper 宏（~L399）、setup 与
+ * buffer API（~L429 与 ~L1808）、绘图/字体 API（~L1860~L2050）。
+ * ============================================================================
+ */
+
+/*
 
   u8g2.h
 
@@ -205,6 +222,10 @@ extern "C" {
 
 /*==========================================*/
 
+/*
+  坐标类型二选一：U8G2_16BIT 时像素坐标用 uint16_t（支持 >255 宽的屏），
+  否则用 uint8_t（AVR 省内存，但坐标上限 255）。宽 >240 像素的屏必须开 16BIT。
+*/
 #ifdef U8G2_16BIT
 typedef uint16_t u8g2_uint_t;	/* for pixel position only */
 typedef int16_t u8g2_int_t;		/* introduced for circle calculation */
@@ -219,6 +240,13 @@ typedef int16_t u8g2_long_t;		/* introduced for ellipse calculation */
 typedef struct u8g2_struct u8g2_t;
 typedef struct u8g2_cb_struct u8g2_cb_t;
 
+/*
+  旋转/镜像"三件套"回调：u8g2_cb_t 就装这三个指针（见 struct u8g2_cb_struct）。
+  update_dimension：算缓冲像素尺寸 + 本页纵向区间 + 用户宽高；
+  update_page_win：算当前页的用户窗口 user_x0..y1（裁剪依据），并套 clip 窗口；
+  draw_l90：所有图元的公共"线段入口"，负责把用户坐标变形（旋转）后交给 hvline。
+  另一个更底层的 ll_hvline 回调单独存在 u8g2_t 里（见下）。
+*/
 typedef void (*u8g2_update_dimension_cb)(u8g2_t *u8g2);
 typedef void (*u8g2_update_page_win_cb)(u8g2_t *u8g2);
 typedef void (*u8g2_draw_l90_cb)(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t len, uint8_t dir);
@@ -228,63 +256,73 @@ typedef uint8_t (*u8g2_get_kerning_cb)(u8g2_t *u8g2, uint16_t e1, uint16_t e2);
 
 
 /* from ucglib... */
+/*
+  字体文件头（u8g2_font.c 的 u8g2_read_font_info 逐字段解析）：
+  前 23 字节描述整个字库——字形计数、RLE 位宽（bits_per_0/1 是"游程 0/1 压缩"
+  的位宽表）、各元数据的位宽、全局 bounding box 与 A/g 的 ascent/descent 参考，
+  以及三个跳转起点（大写 A / 小写 a / unicode 区），用于二分前的粗定位。
+*/
 struct _u8g2_font_info_t
 {
   /* offset 0 */
-  uint8_t glyph_cnt;
-  uint8_t bbx_mode;
-  uint8_t bits_per_0;
-  uint8_t bits_per_1;
-  
+  uint8_t glyph_cnt;			// 字形总数（0xFF = 超过 255，靠 start_pos 兜底）
+  uint8_t bbx_mode;			// 高度参考模式：0=text 1=xtext 2=all（决定 SetFontRefHeight 语义）
+  uint8_t bits_per_0;			// RLE：连续 0 的游程所用位宽
+  uint8_t bits_per_1;			// RLE：连续 1 的游程所用位宽
+
   /* offset 4 */
-  uint8_t bits_per_char_width;
-  uint8_t bits_per_char_height;		
+  uint8_t bits_per_char_width;		// 以下 5 个：每字形元数据（宽/高/x 偏移/y 偏移/步进）各自的位宽
+  uint8_t bits_per_char_height;
   uint8_t bits_per_char_x;
   uint8_t bits_per_char_y;
   uint8_t bits_per_delta_x;
-  
+
   /* offset 9 */
   int8_t max_char_width;
   int8_t max_char_height; /* overall height, NOT ascent. Instead ascent = max_char_height + y_offset */
   int8_t x_offset;
   int8_t y_offset;
-  
+
   /* offset 13 */
-  int8_t  ascent_A;
-  int8_t  descent_g;	/* usually a negative value */
-  int8_t  ascent_para;
+  int8_t  ascent_A;			// 大写 A 的上高（GetAscent 的 TEXT 模式取值来源）
+  int8_t  descent_g;	/* usually a negative value */	// 小写 g 的下探（通常为负）
+  int8_t  ascent_para;			// 括号类字符的上高（ALL 模式）
   int8_t  descent_para;
-    
+
   /* offset 17 */
-  uint16_t start_pos_upper_A;
-  uint16_t start_pos_lower_a; 
-  
+  uint16_t start_pos_upper_A;		// 大写 'A' 字形数据在字体文件内的偏移（优化起点）
+  uint16_t start_pos_lower_a;		// 小写 'a' 的偏移
+
   /* offset 21 */
-#ifdef U8G2_WITH_UNICODE  
-  uint16_t start_pos_unicode;
+#ifdef U8G2_WITH_UNICODE
+  uint16_t start_pos_unicode;		// unicode (>255) 字形区的偏移
 #endif
 };
 typedef struct _u8g2_font_info_t u8g2_font_info_t;
 
 /* from ucglib... */
+/*
+  字体解码工作区：DrawGlyph 时由 u8g2_font_setup_decode 装填，
+  u8g2_font_decode_glyph 按位流消费。属于 u8g2_t 的"单字形渲染现场"。
+*/
 struct _u8g2_font_decode_t
 {
-  const uint8_t *decode_ptr;			/* pointer to the compressed data */
-  
-  u8g2_uint_t target_x;
+  const uint8_t *decode_ptr;			/* pointer to the compressed data */	// 当前字形 RLE 位流的读取游标
+
+  u8g2_uint_t target_x;			// 字形在缓冲中的落笔原点（随 dir 换算）
   u8g2_uint_t target_y;
-  
-  int8_t x;						/* local coordinates, (0,0) is upper left */
+
+  int8_t x;						/* local coordinates, (0,0) is upper left */	// 字形内部局部坐标（渲染中逐段推进）
   int8_t y;
-  int8_t glyph_width;	
+  int8_t glyph_width;
   int8_t glyph_height;
 
-  uint8_t decode_bit_pos;			/* bitpos inside a byte of the compressed data */
-  uint8_t is_transparent;
-  uint8_t fg_color;
+  uint8_t decode_bit_pos;			/* bitpos inside a byte of the compressed data */	// 字节内的位偏移（0..7），位流解压的关键
+  uint8_t is_transparent;			// 1=透明模式（只画 1 位）；0=实心（0 位画 bg_color）
+  uint8_t fg_color;				// 前景色（SetDrawColor 影响）
   uint8_t bg_color;
-#ifdef U8G2_WITH_FONT_ROTATION  
-  uint8_t dir;				/* direction */
+#ifdef U8G2_WITH_FONT_ROTATION
+  uint8_t dir;				/* direction */	// 0..3 绘制方向（0=水平向右）
 #endif
 };
 typedef struct _u8g2_font_decode_t u8g2_font_decode_t;
@@ -301,54 +339,67 @@ struct _u8g2_kerning_t
 typedef struct _u8g2_kerning_t u8g2_kerning_t;
 
 
+/*
+  旋转/镜像回调组：u8g2_setup.c 末尾的 u8g2_cb_r0..r3 / mirror 常量即此类型。
+  U8G2_R0(R1/R2/R3) 三档旋转 + 水平/垂直镜像全靠"换这一组指针"实现。
+*/
 struct u8g2_cb_struct
 {
-  u8g2_update_dimension_cb update_dimension;
-  u8g2_update_page_win_cb update_page_win;
-  u8g2_draw_l90_cb draw_l90;
+  u8g2_update_dimension_cb update_dimension;	// 尺寸/本页区间计算（R1/R3 在此交换宽高）
+  u8g2_update_page_win_cb update_page_win;	// 本页用户窗口计算（页模式窗口随翻页移动）
+  u8g2_draw_l90_cb draw_l90;			// 图元公共线段入口（先旋转变形再交 hvline）
 };
 
-typedef u8g2_uint_t (*u8g2_font_calc_vref_fnptr)(u8g2_t *u8g2);
+typedef u8g2_uint_t (*u8g2_font_calc_vref_fnptr)(u8g2_t *u8g2);	// 字体"参考点"回调：决定 DrawStr 的 y 语义（基线/顶/底/中）
 
 
+/*
+  ================ u8g2_t：图形层上下文（整个库的心脏） ================
+  内存布局分四段：
+  [1] u8x8 通信层（内嵌，故 u8g2_t* 可直接当 u8x8_t* 用，见 u8g2_GetU8x8）
+  [2] 绘制机制：底层像素写入回调 ll_hvline + 旋转回调组 cb + tile 缓冲三兄弟
+  [3] 坐标系/窗口：缓冲像素尺寸、本页区间 buf_y0/y1、用户窗口 user_*、裁剪窗口 clip_*
+  [4] 字体现场：字体指针 + 解码器 + 度量
+  装配入口是 u8g2_SetupBuffer()（u8g2_setup.c），字段生效顺序见该函数。
+*/
 struct u8g2_struct
 {
-  u8x8_t u8x8;
-  u8g2_draw_ll_hvline_cb ll_hvline;	/* low level hvline procedure */
-  const u8g2_cb_t *cb;		/* callback drawprocedures, can be replaced for rotation */
-  
+  u8x8_t u8x8;			// [1] 内嵌通信层：display/cad/byte/gpio 四回调 + display_info 尺寸表
+  u8g2_draw_ll_hvline_cb ll_hvline;	/* low level hvline procedure */	// [2] 最底层像素写入：按控制器显存位序选 vertical_top_lsb 或 horizontal_right_lsb
+  const u8g2_cb_t *cb;		/* callback drawprocedures, can be replaced for rotation */	// [2] 旋转/镜像三件套（R0..R3/mirror），SetDisplayRotation 只换这个指针
+
   /* the following variables must be assigned during u8g2 setup */
-  uint8_t *tile_buf_ptr;	/* ptr to memory area with u8x8.display_info->tile_width * 8 * tile_buf_height bytes */
-  uint8_t tile_buf_height;	/* height of the tile memory area in tile rows */
-  uint8_t tile_curr_row;	/* current row for picture loop */
-  
+  uint8_t *tile_buf_ptr;	/* ptr to memory area with u8x8.display_info->tile_width * 8 * tile_buf_height bytes */	// [2] 帧缓冲首地址：128x64 全缓冲 = 1024B；页模式仅 16B/32B
+  uint8_t tile_buf_height;	/* height of the tile memory area in tile rows */	// [2] 缓冲 tile 行数：_f=满屏 / _2=2 行 / _1=1 行，三种内存模式的分水岭
+  uint8_t tile_curr_row;	/* current row for picture loop */	// [2] 当前页在显示 RAM 中的起始 tile 行（页模式由 NextPage 推进；全缓冲恒 0）
+
   /* dimension of the buffer in pixel */
-  u8g2_uint_t pixel_buf_width;		/* equal to tile_buf_width*8 */
-  u8g2_uint_t pixel_buf_height;		/* tile_buf_height*8 */
-  u8g2_uint_t pixel_curr_row;		/* u8g2.tile_curr_row*8 */
+  u8g2_uint_t pixel_buf_width;		/* equal to tile_buf_width*8 */	// [3] 缓冲宽（像素）= tile_width×8
+  u8g2_uint_t pixel_buf_height;		/* tile_buf_height*8 */		// [3] 缓冲高（像素）
+  u8g2_uint_t pixel_curr_row;		/* u8g2.tile_curr_row*8 */	// [3] 当前页首行的像素 y（页窗口推进基点）
   
   /* the following variables are set by the update dimension callback */
   /* this is the clipbox after rotation for the hvline procedures */
   //u8g2_uint_t buf_x0;	/* left corner of the buffer */
   //u8g2_uint_t buf_x1;	/* right corner of the buffer (excluded) */
-  u8g2_uint_t buf_y0;
+  u8g2_uint_t buf_y0;			// [3] 本页缓冲覆盖的纵向区间 [buf_y0, buf_y1)：hvline 纵向裁剪的硬边界
   u8g2_uint_t buf_y1;
-  
+
   /* display dimensions in pixel for the user, calculated in u8g2_update_dimension_common()  */
-  u8g2_uint_t width;
+  u8g2_uint_t width;			// [3] 用户坐标系宽（R1/R3 旋转时与物理宽高互换）
   u8g2_uint_t height;
-  
+
   /* this is the clip box for the user to check if a specific box has an intersection */
   /* use u8g2_IsIntersection from u8g2_intersection.c to test against this intersection */
   /* actually, this window describes the position of the current page */
-  u8g2_uint_t user_x0;	/* left corner of the buffer */
-  u8g2_uint_t user_x1;	/* right corner of the buffer (excluded) */
+  u8g2_uint_t user_x0;	/* left corner of the buffer */	// [3] 用户绘制窗口 = 当前页 ∩ clip 窗口（右/下界开区间）。
+  u8g2_uint_t user_x1;	/* right corner of the buffer (excluded) */	//     DrawHVLine 依此裁剪；开 INTERSECTION 时上层图元先做快速相交测试
   u8g2_uint_t user_y0;	/* upper edge of the buffer */
   u8g2_uint_t user_y1;	/* lower edge of the buffer (excluded) */
   
 #ifdef U8G2_WITH_CLIP_WINDOW_SUPPORT
   /* clip window */
-  u8g2_uint_t clip_x0;	/* left corner of the clip window */
+  u8g2_uint_t clip_x0;	/* left corner of the clip window */	// [3] 用户自设裁剪窗口（u8g2_SetClipWindow），默认"无限大"（~0）
   u8g2_uint_t clip_x1;	/* right corner of the clip window (excluded) */
   u8g2_uint_t clip_y0;	/* upper edge of the clip window */
   u8g2_uint_t clip_y1;	/* lower edge of the clip window (excluded) */
@@ -356,35 +407,36 @@ struct u8g2_struct
   
   
   /* information about the current font */
-  const uint8_t *font;             /* current font for all text procedures */
+  const uint8_t *font;             /* current font for all text procedures */	// [4] 当前字体数组（extern 声明在本文件后半）；未设置就画字 = 崩溃/花屏
   // removed: const u8g2_kerning_t *kerning;		/* can be NULL */
   // removed: u8g2_get_kerning_cb get_kerning_cb;
-  
-  u8g2_font_calc_vref_fnptr font_calc_vref;
-  u8g2_font_decode_t font_decode;		/* new font decode structure */
-  u8g2_font_info_t font_info;			/* new font info structure */
+
+  u8g2_font_calc_vref_fnptr font_calc_vref;	// [4] 文字定位基准回调：baseline/bottom/top/center 四选一
+  u8g2_font_decode_t font_decode;		/* new font decode structure */	// [4] 单字形渲染现场（RLE 位流游标、局部坐标、透明模式、前景/背景色）
+  u8g2_font_info_t font_info;			/* new font info structure */	// [4] 字体文件头缓存（u8g2_SetFont 时解析一次）
 
 #ifdef U8G2_WITH_CLIP_WINDOW_SUPPORT
   /* 1 of there is an intersection between user_?? and clip_?? box */
-  uint8_t is_page_clip_window_intersection;
+  uint8_t is_page_clip_window_intersection;	// [3] clip 窗口与当前页是否有交叠：0 时绘制整体短路（页模式提速关键）
 #endif /* U8G2_WITH_CLIP_WINDOW_SUPPORT */
 
-  uint8_t font_height_mode;
-  int8_t font_ref_ascent;
-  int8_t font_ref_descent;
-  
-  int8_t glyph_x_offset;		/* set by u8g2_GetGlyphWidth as a side effect */
-  
-  uint8_t bitmap_transparency;	/* black pixels will be treated as transparent (not drawn) */
+  uint8_t font_height_mode;	// [4] 字高参考模式 U8G2_FONT_HEIGHT_MODE_TEXT/XTEXT/ALL
+  int8_t font_ref_ascent;	// [4] 当前字体参考上高（u8g2_GetAscent 的返回值来源）
+  int8_t font_ref_descent;	// [4] 当前字体参考下探（通常为负）
+
+  int8_t glyph_x_offset;		/* set by u8g2_GetGlyphWidth as a side effect */	// [4] 上次查询字形的 x 偏移（"副作用"输出，见 u8g2_GetGlyphWidth）
+
+  uint8_t bitmap_transparency;	/* black pixels will be treated as transparent (not drawn) */	// DrawBitmap 透明模式开关（0 位不画）
 
   uint8_t draw_color;		/* 0: clear pixel, 1: set pixel, modified and restored by font procedures */
-					/* draw_color can be used also directly by the user API */
-					
+					/* draw_color can be used also directly by the user API */	// [4] 画笔：1=点亮 0=擦除；字体绘制会临时改它并恢复
+
 	// the following variable should be renamed to is_buffer_auto_clear
-  uint8_t is_auto_page_clear; 		/* set to 0 to disable automatic clear of the buffer in firstPage() and nextPage() */
+  uint8_t is_auto_page_clear; 		/* set to 0 to disable automatic clear of the buffer in firstPage() and nextPage() */	// 1=FirstPage/NextPage 自动清缓冲（默认）；0=自行管理（省时但易忘清）
   
 };
 
+// u8g2_t 首成员是 u8x8_t，指针可直接强转——所有通信层宏都靠它"降级"调用 u8x8 API
 #define u8g2_GetU8x8(u8g2) ((u8x8_t *)(u8g2))
 //#define u8g2_GetU8x8(u8g2) (&((u8g2)->u8x8))
 
@@ -393,11 +445,17 @@ struct u8g2_struct
 #define u8g2_SetUserPtr(u8g2, p) ((u8g2_GetU8x8(u8g2))->user_ptr = (p))
 #endif
 
-// this should be renamed to SetBufferAutoClear 
+// this should be renamed to SetBufferAutoClear
+// 分页模式是否自动清缓冲：1（默认）省心；0 省时间，但每页必须自己 ClearBuffer
 #define u8g2_SetAutoPageClear(u8g2, mode) ((u8g2)->is_auto_page_clear = (mode))
 
 /*==========================================*/
 /* u8x8 wrapper */
+/*
+  下面这组宏 = "降级到 u8x8 层"的一行转发：u8g2 不重复实现通信细节，
+  InitDisplay/SetPowerSave/SetContrast 等都直接调 u8x8 的同名函数。
+  宏在编译期展开为零开销——这也是 u8g2/u8x8 双层不分文件的原因之一。
+*/
 
 #define u8g2_SetupDisplay(u8g2, display_cb, cad_cb, byte_cb, gpio_and_delay_cb) \
   u8x8_Setup(u8g2_GetU8x8(u8g2), (display_cb), (cad_cb), (byte_cb), (gpio_and_delay_cb))
@@ -429,6 +487,11 @@ void u8g2_ClearDisplay(u8g2_t *u8g2);
 /*==========================================*/
 /* u8g2_setup.c */
 
+/*
+  旋转/镜像选择宏（传给 u8g2_Setup_xxx 的 rotation 参数）：
+  R0 不转；R1/R2/R3 = 用户坐标系顺时针转 90/180/270°（宽高互换发生在 R1/R3）；
+  MIRROR 水平镜像；MIRROR_VERTICAL 垂直镜像。实现 = u8g2_setup.c 末尾的 6 组常量回调表。
+*/
 void u8g2_draw_l90_r0(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t len, uint8_t dir);
 
 extern const u8g2_cb_t u8g2_cb_r0;
@@ -455,18 +518,36 @@ extern const u8g2_cb_t u8g2_cb_mirror_vertical;
       
 */
 
+/**
+ * @brief 裁剪窗口 API：SetMaxClipWindow 关闭裁剪；SetClipWindow 限定绘制区域（右/下界不含）
+ */
 void u8g2_SetMaxClipWindow(u8g2_t *u8g2);
 void u8g2_SetClipWindow(u8g2_t *u8g2, u8g2_uint_t clip_x0, u8g2_uint_t clip_y0, u8g2_uint_t clip_x1, u8g2_uint_t clip_y1 );
 
+/**
+ * @brief 中央装配函数：所有 u8g2_Setup_xxx_N() 的公共终点（详见 u8g2_setup.c 同名实现）
+ * @param  buf              帧缓冲；tile_buf_height 决定全缓冲/页模式
+ * @param  ll_hvline_cb     像素写入回调（按显存位序二选一）
+ * @param  u8g2_cb          旋转回调组 U8G2_R0..R3
+ */
 void u8g2_SetupBuffer(u8g2_t *u8g2, uint8_t *buf, uint8_t tile_buf_height, u8g2_draw_ll_hvline_cb ll_hvline_cb, const u8g2_cb_t *u8g2_cb);
+/** @brief 运行期换旋转/镜像（换 cb 指针 + 重算窗口，缓冲内容不搬动） */
 void u8g2_SetDisplayRotation(u8g2_t *u8g2, const u8g2_cb_t *u8g2_cb);
 
+/** @brief printf 风格直接向控制器发命令/数据（绕过缓冲，用于控制器专属指令） */
 void u8g2_SendF(u8g2_t * u8g2, const char *fmt, ...);
 
 /* null device setup */
 void u8g2_Setup_null(u8g2_t *u8g2, const u8g2_cb_t *rotation, u8x8_msg_cb byte_cb, u8x8_msg_cb gpio_and_delay_cb);
 
 /*==========================================*/
+/*
+  【生成代码声明区 1/2】u8g2_d_memory.c 的缓冲分配函数。
+  命名规则 u8g2_m_<tile宽>_<tile高>_<模式>：模式 1=单页缓冲、2=两页缓冲、f=全缓冲(full)。
+  每个函数返回一个静态数组（大小 = tile宽×8×页数），并把实际页数写回 *page_cnt。
+  例如 128x64 屏：u8g2_m_16_8_1 = 16×8×1 = 128B（页模式），u8g2_m_16_8_f = 1024B（全缓冲）。
+  巨型清单由 tools 按支持的所有屏生成，实际链接时只保留被引用的函数。
+*/
 /* u8g2_d_memory.c generated code start */
 uint8_t *u8g2_m_16_4_1(uint8_t *page_cnt);
 uint8_t *u8g2_m_16_4_2(uint8_t *page_cnt);
@@ -697,6 +778,13 @@ uint8_t *u8g2_m_48_30_f(uint8_t *page_cnt);
 /* u8g2_d_memory.c generated code end */
 
 /*==========================================*/
+/*
+  【生成代码声明区 2/2】u8g2_d_setup.c 的屏幕装配函数（共 1104 个）。
+  命名规则 u8g2_Setup_<控制器>[_i2c]_<分辨率>_<型号别名>_<模式>：
+  i2c 前缀切换通信 CAD 层；模式后缀 1=单页 / 2=双页 / f=全缓冲。
+  每个函数做三件事：u8g2_SetupDisplay（装驱动回调+CAD）→ 取缓冲（调上面的
+  u8g2_m_*）→ u8g2_SetupBuffer（中央装配）。用户只需按屏型号调用其一。
+*/
 /* u8g2_d_setup.c generated code start */
 void u8g2_Setup_ssd1305_128x32_noname_1(u8g2_t *u8g2, const u8g2_cb_t *rotation, u8x8_msg_cb byte_cb, u8x8_msg_cb gpio_and_delay_cb);
 void u8g2_Setup_ssd1305_128x32_adafruit_1(u8g2_t *u8g2, const u8g2_cb_t *rotation, u8x8_msg_cb byte_cb, u8x8_msg_cb gpio_and_delay_cb);
@@ -1807,13 +1895,27 @@ void u8g2_Setup_ssd1315_i2c_128x64_noname_f(u8g2_t *u8g2, const u8g2_cb_t *rotat
 
 /*==========================================*/
 /* u8g2_buffer.c */
-
+/*
+  ============ 缓冲管理与"发送缓冲"机制（本文件的 API 契约核心之一） ============
+  u8g2 的一切绘制只写 RAM 缓冲；把缓冲送上屏幕的有两条路：
+  路 A（图片循环/picture loop，页模式省 RAM 的根源）：
+      u8g2_FirstPage() → do { 画图 } while( u8g2_NextPage() )；
+      NextPage 内部把当前页发出、清缓冲、推进 tile_curr_row。
+  路 B（整帧直发）：ClearBuffer → 画图 → SendBuffer/UpdateDisplay 一次发完。
+  两路最终都收敛到内部 u8g2_send_buffer()：按 tile 行逐行调 u8x8_DrawTile，
+  经 cad→byte 消息链落到控制器 RAM。
+*/
+/** @brief 发整帧缓冲 + 电子纸刷新消息（绘制四步曲第三步；普通屏与 UpdateDisplay 等价） */
 void u8g2_SendBuffer(u8g2_t *u8g2);
+/** @brief RAM 帧缓冲整体清零（不碰显示 RAM；可见效果要等发送） */
 void u8g2_ClearBuffer(u8g2_t *u8g2);
 
+/** @brief 手动拨页：设置当前 tile 行并联动重算裁剪窗口（页模式高级用法） */
 void u8g2_SetBufferCurrTileRow(u8g2_t *u8g2, uint8_t row) U8G2_NOINLINE;
 
+/** @brief 图片循环开头：清缓冲（若 auto clear）+ 页指针归零 */
 void u8g2_FirstPage(u8g2_t *u8g2);
+/** @brief 图片循环推进：发当前页→翻页；返回 0 表示整屏发完（循环结束） */
 uint8_t u8g2_NextPage(u8g2_t *u8g2);
 
 // Add ability to set buffer pointer
@@ -1824,6 +1926,13 @@ uint8_t u8g2_NextPage(u8g2_t *u8g2);
 #ifdef U8G2_USE_DYNAMIC_ALLOC
 #define u8g2_SetBufferPtr(u8g2, buf) ((u8g2)->tile_buf_ptr = (buf));
 #endif
+/*
+  缓冲访问宏组：
+  GetBufferSize = 缓冲字节数（tile宽×8×tile_buf_height）——动态分配时据此确定数组大小/加大栈；
+  GetBufferPtr  = 缓冲首地址（可直接 memcpy/自己做特效）；
+  GetBufferTileWidth/Height = 缓冲 tile 尺寸（宽 tile 数在 display_info，高在 u8g2_t）；
+  GetBufferCurrTileRow = 当前页行号（仅 FirstPage 之后有意义，issue #370 更名）。
+*/
 #define u8g2_GetBufferSize(u8g2) ((u8g2)->u8x8.display_info->tile_width * 8 * (u8g2)->tile_buf_height)
 #define u8g2_GetBufferPtr(u8g2) ((u8g2)->tile_buf_ptr)
 #define u8g2_GetBufferTileHeight(u8g2)	((u8g2)->tile_buf_height)
@@ -1833,12 +1942,21 @@ uint8_t u8g2_NextPage(u8g2_t *u8g2);
 #define u8g2_GetPageCurrTileRow(u8g2) ((u8g2)->tile_curr_row)
 #define u8g2_GetBufferCurrTileRow(u8g2) ((u8g2)->tile_curr_row)
 
+/**
+ * @brief 局部刷新：把缓冲中 (tx,ty) 起 tw×th 个 tile 直接发到显示 RAM（仅全缓冲模式有效）
+ * @param  tx/ty  tile 坐标（像素坐标÷8）；tw/th tile 个数
+ * @note   与 SendBuffer 的区别：跳过缓冲中未变化的部分，降低总线流量；
+ *         代价是忽略旋转/镜像、参数不校验、不发电子纸刷新。
+ */
 void u8g2_UpdateDisplayArea(u8g2_t *u8g2, uint8_t  tx, uint8_t ty, uint8_t tw, uint8_t th);
+/** @brief 发整帧缓冲但不发刷新消息（电子纸"只改 RAM 不成像"；普通屏 ≈ SendBuffer） */
 void u8g2_UpdateDisplay(u8g2_t *u8g2);
 
+/** @brief 缓冲导出为 PBM/XBM 文本流（get_pixel_1 = 竖排字节架构，SSD1306 类） */
 void u8g2_WriteBufferPBM(u8g2_t *u8g2, void (*out)(const char *s));
 void u8g2_WriteBufferXBM(u8g2_t *u8g2, void (*out)(const char *s));
-/* SH1122, LD7032, ST7920, ST7986, LC7981, T6963, SED1330, RA8835, MAX7219, LS0 */ 
+/* SH1122, LD7032, ST7920, ST7986, LC7981, T6963, SED1330, RA8835, MAX7219, LS0 */
+/** @brief PBM/XBM 导出的横排字节变体（get_pixel_2，适配 ST7920/T6963 等横排架构） */
 void u8g2_WriteBufferPBM2(u8g2_t *u8g2, void (*out)(const char *s));
 void u8g2_WriteBufferXBM2(u8g2_t *u8g2, void (*out)(const char *s));
 
@@ -1862,28 +1980,43 @@ void u8g2_ll_hvline_horizontal_right_lsb(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_
 
 /*==========================================*/
 /* u8g2_hvline.c */
+/*
+  ============ 绘制管线的心跳：HVLine ============
+  u8g2 所有图元（框/圆/位图/字形）最终都拆成水平/垂直线，汇聚到 DrawHVLine：
+  裁剪（user 窗口 + buf_y 区间）→ 旋转 cb 变形 → ll_hvline 逐字节写缓冲。
+  理解了这一条链，整个绘制子系统的骨架就通了。
+*/
 
+/** @brief 最通用线段入口（dir 0=水平 1=垂直）：只裁剪、不做相交预测试（图元内部专用） */
 /* u8g2_DrawHVLine does not use u8g2_IsIntersection */
 void u8g2_DrawHVLine(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t len, uint8_t dir);
 
 /* the following three function will do an intersection test of this is enabled with U8G2_WITH_INTERSECTION */
+/** @brief 以下三个是用户 API：开 U8G2_WITH_INTERSECTION 时先快速判断"与本页相交吗"，省 CPU */
 void u8g2_DrawHLine(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t len);
 void u8g2_DrawVLine(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t len);
 void u8g2_DrawPixel(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y);
+/** @brief 画笔颜色：1=点亮 0=擦除（影响所有 DrawXxx 与字体；字体绘制会临时改并恢复） */
 void u8g2_SetDrawColor(u8g2_t *u8g2, uint8_t color) U8G2_NOINLINE;  /* u8g: u8g_SetColorIndex(u8g_t *u8g, uint8_t idx); */
 
 
 /*==========================================*/
 /* u8g2_bitmap.c */
+/** @brief 位图模式：0=实心（0 位也画），1=透明（0 位跳过，可叠底图） */
 void u8g2_SetBitmapMode(u8g2_t *u8g2, uint8_t is_transparent);
+/** @brief 画一行位图（len 字节，MSB 在左）；DrawBitmap 的底层一步 */
 void u8g2_DrawHorizontalBitmap(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t len, const uint8_t *b);
+/** @brief 画位图：cnt 字节宽 × h 高，行优先；逐位拆成 DrawPixel（慢但通用） */
 void u8g2_DrawBitmap(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t cnt, u8g2_uint_t h, const uint8_t *bitmap);
+/** @brief 画 XBM 格式（LSB 在左，与 X11 工具链兼容）的 RAM 位图 */
 void u8g2_DrawXBM(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, u8g2_uint_t h, const uint8_t *bitmap);
+/** @brief 同 DrawXBM，但数据在 PROGMEM/flash（AVR 上逐字节 pgm_read 取出） */
 void u8g2_DrawXBMP(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, u8g2_uint_t h, const uint8_t *bitmap);	/* assumes bitmap in PROGMEM */
 
 
 /*==========================================*/
 /* u8g2_intersection.c */
+/** @brief 快速相交测试：矩形与当前 user 窗口有交叠返回 1（页模式省绘制的门卫） */
 #ifdef U8G2_WITH_INTERSECTION    
 uint8_t u8g2_IsIntersection(u8g2_t *u8g2, u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t x1, u8g2_uint_t y1);
 #endif /* U8G2_WITH_INTERSECTION */
@@ -1892,36 +2025,51 @@ uint8_t u8g2_IsIntersection(u8g2_t *u8g2, u8g2_uint_t x0, u8g2_uint_t y0, u8g2_u
 
 /*==========================================*/
 /* u8g2_circle.c */
+/*
+  四象限开关位：option 按位或选择画哪几个 90° 扇区（0x01 右上 … 0x08 右下），
+  U8G2_DRAW_ALL = 0x0F。圆/椭圆/实心椭圆共用这套 option 语义。
+*/
 #define U8G2_DRAW_UPPER_RIGHT 0x01
 #define U8G2_DRAW_UPPER_LEFT  0x02
 #define U8G2_DRAW_LOWER_LEFT 0x04
 #define U8G2_DRAW_LOWER_RIGHT  0x08
 #define U8G2_DRAW_ALL (U8G2_DRAW_UPPER_RIGHT|U8G2_DRAW_UPPER_LEFT|U8G2_DRAW_LOWER_RIGHT|U8G2_DRAW_LOWER_LEFT)
+/** @brief 圆周（中点圆算法）；DrawDisc 实心圆逐行画 hline，速度优于逐像素 */
 void u8g2_DrawCircle(u8g2_t *u8g2, u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t rad, uint8_t option);
 void u8g2_DrawDisc(u8g2_t *u8g2, u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t rad, uint8_t option);
+/** @brief 椭圆（Bresenham 变体，rx/ry 为两轴半径）；Filled 版逐行填充 */
 void u8g2_DrawEllipse(u8g2_t *u8g2, u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t rx, u8g2_uint_t ry, uint8_t option);
 void u8g2_DrawFilledEllipse(u8g2_t *u8g2, u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t rx, u8g2_uint_t ry, uint8_t option);
 
 
 /*==========================================*/
 /* u8g2_arc.c */
+/** @brief 圆弧：start/end 为 0..255 角度刻度（0°在右，一圈 = 256 步，逆时针） */
 void u8g2_DrawArc(u8g2_t *u8g2, u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t rad, uint8_t start, uint8_t end);
 
 
 /*==========================================*/
 /* u8g2_line.c */
+/** @brief 任意斜线（Bresenham），内部逐点转 DrawPixel——比 hvline 慢但方向自由 */
 void u8g2_DrawLine(u8g2_t *u8g2, u8g2_uint_t x1, u8g2_uint_t y1, u8g2_uint_t x2, u8g2_uint_t y2);
 
 
 /*==========================================*/
 /* u8g2_box.c */
+/** @brief 实心矩形（逐行 DrawHVLine，最快图元之一）；Frame = 空框（4 条 hvline） */
 void u8g2_DrawBox(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, u8g2_uint_t h);
 void u8g2_DrawFrame(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, u8g2_uint_t h);
+/** @brief 圆角版：RBox 实心 / RFrame 空框，r 为四角 1/4 圆的半径 */
 void u8g2_DrawRBox(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, u8g2_uint_t h, u8g2_uint_t r);
 void u8g2_DrawRFrame(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, u8g2_uint_t h, u8g2_uint_t r);
 
 /*==========================================*/
 /* u8g2_button.c */
+/*
+  按钮 UI：flags 参数是一个"位域包"——bit0..2 边框宽度(BW0..3)、bit3..4 阴影档位
+  (SHADOW0..2)、bit5 反显(INV)、bit6 水平居中(HCENTER)、bit7 双线框(XFRAME)。
+  宽度按当前字体 StrWidth + padding 计算后再画框/阴影/文字。
+*/
 
 /* border width */
 #define U8G2_BTN_BW_POS 0
@@ -1953,9 +2101,11 @@ void u8g2_DrawButtonUTF8(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t
 
 /*==========================================*/
 /* u8g2_polygon.c */
+/** @brief 多边形 API：先 Clear+Add 逐顶点（坐标存在全局数组），再一次 DrawPolygon 填充 */
 void u8g2_ClearPolygonXY(void);
 void u8g2_AddPolygonXY(u8g2_t *u8g2, int16_t x, int16_t y);
 void u8g2_DrawPolygon(u8g2_t *u8g2);
+/** @brief 三角形填充（多边形的 3 顶点特例，同样走扫描线算法） */
 void u8g2_DrawTriangle(u8g2_t *u8g2, int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2);
 
 
@@ -1963,43 +2113,61 @@ void u8g2_DrawTriangle(u8g2_t *u8g2, int16_t x0, int16_t y0, int16_t x1, int16_t
 /*==========================================*/
 /* u8g2_kerning.c */
 //uint8_t u8g2_GetNullKerning(u8g2_t *u8g2, uint16_t e1, uint16_t e2);
+/** @brief 查字偶间距（kerning）：相邻两字符 e1、e2 之间的额外间距（0 = 无） */
 uint8_t u8g2_GetKerning(u8g2_t *u8g2, u8g2_kerning_t *kerning, uint16_t e1, uint16_t e2);
 uint8_t u8g2_GetKerningByTable(u8g2_t *u8g2, const uint16_t *kt, uint16_t e1, uint16_t e2);
 
 
 /*==========================================*/
 /* u8g2_font.c */
+/*
+  ============ 字体 API 契约（实现细节在 u8g2_font.c，属下半场伙伴的地盘） ============
+  核心链路：SetFont 解析字体头 → DrawStr/DrawUTF8 逐字符取字形数据（RLE 压缩）
+  → font_decode 位流解码 → 逐段转 hvline 落入缓冲。
+  y 坐标语义由"参考点"决定：font_calc_vref（SetFontPos* 四选一）
+  + font_ref_ascent/descent（SetFontRefHeight* 三档决定怎么算高）。
+*/
 
+/** @brief 旋转坐标换算工具（按 dir 把字形内偏移向量旋转到屏幕方向） */
 u8g2_uint_t u8g2_add_vector_y(u8g2_uint_t dy, int8_t x, int8_t y, uint8_t dir) U8G2_NOINLINE;
 u8g2_uint_t u8g2_add_vector_x(u8g2_uint_t dx, int8_t x, int8_t y, uint8_t dir) U8G2_NOINLINE;
 
 
+/** @brief 返回字体数组总字节数（字体数据自带长度字段，可用于 flash 校验） */
 size_t u8g2_GetFontSize(const uint8_t *font_arg);
 
+/* 字高参考三档：TEXT=按大写 A 上高；XTEXT=TEXT+下探；ALL=含括号/重音的极限范围 */
 #define U8G2_FONT_HEIGHT_MODE_TEXT 0
 #define U8G2_FONT_HEIGHT_MODE_XTEXT 1
 #define U8G2_FONT_HEIGHT_MODE_ALL 2
 
+/** @brief 设置当前字体并解析文件头（画字前必调；font=NULL 是常见事故源） */
 void u8g2_SetFont(u8g2_t *u8g2, const uint8_t  *font);
+/** @brief 字体绘制模式：0=实心（画背景），1=透明（只画笔画，可叠图） */
 void u8g2_SetFontMode(u8g2_t *u8g2, uint8_t is_transparent);
 
+/** @brief 字形查询：IsGlyph 判存在；GetGlyphWidth 返回步进宽度（x_offset 是副作用输出） */
 uint8_t u8g2_IsGlyph(u8g2_t *u8g2, uint16_t requested_encoding);
 int8_t u8g2_GetGlyphWidth(u8g2_t *u8g2, uint16_t requested_encoding);
 
+/** @brief 画单字符；X2 变体放大 2 倍绘制（无大字体时的应急方案） */
 u8g2_uint_t u8g2_DrawGlyph(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, uint16_t encoding);
 u8g2_uint_t u8g2_DrawGlyphX2(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, uint16_t encoding);
 int8_t u8g2_GetStrX(u8g2_t *u8g2, const char *s);	/* for u8g compatibility, WARNING: use u8g2_GetGlyphXOffset() instead! */
 int8_t u8g2_GetXOffsetGlyph(u8g2_t *u8g2, uint16_t encoding);
 int8_t u8g2_GetXOffsetUTF8(u8g2_t *u8g2, const char *utf8);
 
+/** @brief 画字符串：DrawStr 走 ISO-8859-1，DrawUTF8 走 UTF-8 解码（U8G2_WITH_UNICODE）；X2 同上 */
 void u8g2_SetFontDirection(u8g2_t *u8g2, uint8_t dir);
 u8g2_uint_t u8g2_DrawStr(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, const char *str);
 u8g2_uint_t u8g2_DrawStrX2(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, const char *str);
 u8g2_uint_t u8g2_DrawUTF8(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, const char *str);
 u8g2_uint_t u8g2_DrawUTF8X2(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, const char *str);
+/** @brief 双向绘制变体（to_left=向左画，配合 kerning 做排版级输出） */
 u8g2_uint_t u8g2_DrawExtendedUTF8(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, uint8_t to_left, u8g2_kerning_t *kerning, const char *str);
 u8g2_uint_t u8g2_DrawExtUTF8(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, uint8_t to_left, const uint16_t *kerning_table, const char *str);
 
+/* 字体度量宏：max_char_* 来自字体头；Ascent/Descent 是按 font_height_mode 算出的参考值 */
 #define u8g2_GetMaxCharHeight(u8g2) ((u8g2)->font_info.max_char_height)
 #define u8g2_GetMaxCharWidth(u8g2) ((u8g2)->font_info.max_char_width)
 #define u8g2_GetAscent(u8g2) ((u8g2)->font_ref_ascent)
@@ -2007,43 +2175,52 @@ u8g2_uint_t u8g2_DrawExtUTF8(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, uint8_t
 #define u8g2_GetFontAscent(u8g2) ((u8g2)->font_ref_ascent)
 #define u8g2_GetFontDescent(u8g2) ((u8g2)->font_ref_descent)
 
+/** @brief 校验字符串是否为合法 UTF-8（防乱码进绘制管线） */
 uint8_t u8g2_IsAllValidUTF8(u8g2_t *u8g2, const char *str);	// checks whether all codes are valid
 
+/** @brief 量字符串宽度（像素）：逐字符累计步进宽度，画菜单/对齐前必用 */
 u8g2_uint_t u8g2_GetStrWidth(u8g2_t *u8g2, const char *s);
 u8g2_uint_t u8g2_GetUTF8Width(u8g2_t *u8g2, const char *str);
 /*u8g2_uint_t u8g2_GetExactStrWidth(u8g2_t *u8g2, const char *s);*/ /*obsolete, see also https://github.com/olikraus/u8g2/issues/1561 */
 
 
+/* 文字参考点四选一：DrawStr 的 y 到底指"基线/底部/顶部/垂直中线"，默认基线 */
 void u8g2_SetFontPosBaseline(u8g2_t *u8g2);
 void u8g2_SetFontPosBottom(u8g2_t *u8g2);
 void u8g2_SetFontPosTop(u8g2_t *u8g2);
 void u8g2_SetFontPosCenter(u8g2_t *u8g2);
 
+/* 字高参考三选一（决定 GetAscent/Descent 的算法，影响 PosTop/Center 的落点） */
 void u8g2_SetFontRefHeightText(u8g2_t *u8g2);
 void u8g2_SetFontRefHeightExtendedText(u8g2_t *u8g2);
 void u8g2_SetFontRefHeightAll(u8g2_t *u8g2);
 
+/** @brief 直接画一组"已编码位图字形"数据（u8g 兼容/特殊字形注入用） */
 void u8g2_DrawHB(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, const unsigned char *data);
 
 
 /*==========================================*/
 /* u8log_u8g2.c */
+/** @brief 终端仿真组件：把 u8log_t 的"屏幕字符缓冲"画到 u8g2 缓冲（u8log.c 是核心逻辑） */
 void u8g2_DrawLog(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8log_t *u8log);
 void u8log_u8g2_cb(u8log_t * u8log);
 
 
 /*==========================================*/
 /* u8g2_selection_list.c */
+/** @brief 简易 UI 三件套：反显一行 UTF-8 文本 / 多行列表 / 内置选择列表（返回用户选项） */
 void u8g2_DrawUTF8Line(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, const char *s, uint8_t border_size, uint8_t is_invert);
 u8g2_uint_t u8g2_DrawUTF8Lines(u8g2_t *u8g2, u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t w, u8g2_uint_t line_height, const char *s);
 uint8_t u8g2_UserInterfaceSelectionList(u8g2_t *u8g2, const char *title, uint8_t start_pos, const char *sl);
 
 /*==========================================*/
 /* u8g2_message.c */
+/** @brief 消息框 UI：三行标题 + 按钮（返回按下的按钮序号），自带按键轮询（menu pins） */
 uint8_t u8g2_UserInterfaceMessage(u8g2_t *u8g2, const char *title1, const char *title2, const char *title3, const char *buttons);
 
 /*==========================================*/
 /* u8g2_input_value.c */
+/** @brief 数值输入 UI：title + 前后缀 + lo/hi 范围，用户用菜单键调整，返回确认/取消 */
 uint8_t u8g2_UserInterfaceInputValue(u8g2_t *u8g2, const char *title, const char *pre, uint8_t *value, uint8_t lo, uint8_t hi, uint8_t digits, const char *post);
 
 
@@ -2083,6 +2260,15 @@ void u8g2_SetupBuffer_Utf8(u8g2_t *u8g2, const u8g2_cb_t *u8g2_cb);
 
 
 /*==========================================*/
+
+/*
+  ============ 字体 extern 声明区（约 2200 行，仅声明不含数据） ============
+  命名规则 u8g2_font_<字体名>_<字形集><编码宽度>：
+  第 1 段 t/m/h = 字形集 transparent(仅 ASCII 可见字符)/monospace/huge(扩展)；
+  第 2 段 f/r/n/e/u = 每 glyph 编码位数 fixed-width/relative/nibble/...，
+  影响字体文件大小与渲染取位方式（详见 u8g2_font.c）。
+  数据本体在 u8g2_fonts.c（巨型数组），引用哪个字体就链接哪个。
+*/
 
 /* start font list */
 extern const uint8_t u8g2_font_u8glib_4_tf[] U8G2_FONT_SECTION("u8g2_font_u8glib_4_tf");
